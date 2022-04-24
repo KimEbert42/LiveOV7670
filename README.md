@@ -1,5 +1,9 @@
 # LiveOV7670
-  
+
+Updated to write to SD card and use a servo.
+
+The SD Card cannot keep up, so noise will appear in output.
+ 
 Demo:  
 https://www.youtube.com/watch?v=TqSY6FETuos&list=PLVilroPGLJaesaS5mP93i0goPck2JK-O4&index=2  
   

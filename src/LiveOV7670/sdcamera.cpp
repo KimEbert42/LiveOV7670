@@ -1,10 +1,12 @@
-//
-// Created by indrek on 1.05.2016.
-//
 
-// set EXAMPLE to EXAMPLE_UART in setup.h to activate
+#include <SPI.h>
+#include <SD.h>
+
+const int chipSelect = 4;
+File dataFile;
+
 #include "setup.h"
-#if EXAMPLE == 3
+#if EXAMPLE == 5
 #include "Arduino.h"
 
 
@@ -29,7 +31,7 @@
 // 15 - 2Mbps 320x240 grayscale
 // 16 - 2Mbps 640x480 rgb
 // 17 - 2Mbps 640x480 grayscale
-#define UART_MODE 5
+#define UART_MODE 1
 
 
 
@@ -53,10 +55,6 @@ const uint8_t L_BYTE_PARITY_INVERT = 0b00100000;
 // Since the parity for L byte can be zero we must ensure that the total byet value is above zero.
 // Increasing the lowest bit of blue color is OK for that.
 const uint8_t L_BYTE_PREVENT_ZERO  = 0b00000001;
-
-
-const uint16_t COLOR_GREEN = 0x07E0;
-const uint16_t COLOR_RED = 0xF800;
 
 
 
@@ -264,11 +262,8 @@ uint16_t frameCounter = 0;
 uint16_t processedByteCountDuringCameraRead = 0;
 
 
-void commandStartNewFrame(uint8_t pixelFormat);
-void commandDebugPrint(const String debugText);
 uint8_t sendNextCommandByte(uint8_t checksum, uint8_t commandByte);
 
-void sendBlankFrame(uint16_t color);
 inline void processNextGrayscalePixelByteInBuffer() __attribute__((always_inline));
 inline void processNextRgbPixelByteInBuffer() __attribute__((always_inline));
 inline void tryToSendNextRgbPixelByteInBuffer() __attribute__((always_inline));
@@ -278,7 +273,6 @@ inline uint8_t formatRgbPixelByteL(uint8_t byte) __attribute__((always_inline));
 inline uint8_t formatPixelByteGrayscaleFirst(uint8_t byte) __attribute__((always_inline));
 inline uint8_t formatPixelByteGrayscaleSecond(uint8_t byte) __attribute__((always_inline));
 inline void waitForPreviousUartByteToBeSent() __attribute__((always_inline));
-inline bool isUartReady() __attribute__((always_inline));
 
 
 
@@ -292,154 +286,79 @@ void initializeScreenAndCamera() {
 
   pinMode(PB1,INPUT);
 
-  Serial.begin(baud);
+  Serial.begin(9600);
+
+  while (!Serial) {
+    ; // wait for serial port to connect. Needed for Leonardo only
+  }
+
+  Serial.print(F("Initializing SD card..."));
+  // make sure that the default chip select pin is set to
+  // output, even if you don't use it:
+  pinMode(SS, OUTPUT);
+  
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println(F("Card failed, or not present"));
+    // don't do anything more:
+    while (1) ;
+  }
+  Serial.println(F("card initialized."));
+  
+  // Open up the file we're going to log to!
+  dataFile = SD.open(F("datalog.txt"), FILE_WRITE);
+  if (! dataFile) {
+    Serial.println(F("error opening datalog.txt"));
+    // Wait forever since we cant write data
+    while (1) ;
+  }
+  
+  dataFile.flush();
+  dataFile.close();
+
+  
   if (camera.init()) {
-    sendBlankFrame(COLOR_GREEN);
+
+    
     delay(1000);
   } else {
-    sendBlankFrame(COLOR_RED);
+    Serial.print(F("Camera init failed..."));
     delay(3000);
+    while (1) ;
   }
 }
-
-
-void sendBlankFrame(uint16_t color) {
-  uint8_t colorH = (color >> 8) & 0xFF;
-  uint8_t colorL = color & 0xFF;
-
-  commandStartNewFrame(UART_PIXEL_FORMAT_RGB565);
-  for (uint16_t j=0; j<lineCount; j++) {
-    for (uint16_t i=0; i<lineLength; i++) {
-      waitForPreviousUartByteToBeSent();
-      UDR0 = formatRgbPixelByteH(colorH);
-      waitForPreviousUartByteToBeSent();
-      UDR0 = formatRgbPixelByteL(colorL);
-    }
-  }
-}
-
-
 
 
 // this is called in Arduino loop() function
 void processFrame() {
   processedByteCountDuringCameraRead = 0;
-  commandStartNewFrame(uartPixelFormat);
+
+ 
+  char fileName[10];
+  sprintf(fileName, "%d.dat", frameCounter);
+  Serial.print(fileName);
+
+  dataFile = SD.open(fileName, FILE_WRITE);
+  if (! dataFile) {
+    Serial.println(F("error opening data file"));
+    // Wait forever since we cant write data
+    while (1) ;
+  }
   noInterrupts();
   processFrameData();
   interrupts();
+  dataFile.flush();
+  dataFile.close();
+
+
   frameCounter++;
-  commandDebugPrint("Frame " + String(frameCounter)/* + " " + String(processedByteCountDuringCameraRead)*/);
+  //commandDebugPrint(String(frameCounter)/* + " " + String(processedByteCountDuringCameraRead)*/);
   //commandDebugPrint("Frame " + String(frameCounter, 16)); // send number in hexadecimal
 }
 
-
-void processGrayscaleFrameBuffered() {
-  camera.waitForVsync();
-  commandDebugPrint("Vsync");
-
-  camera.ignoreVerticalPadding();
-
-  for (uint16_t y = 0; y < lineCount; y++) {
-    lineBufferSendByte = &lineBuffer[0];
-    camera.ignoreHorizontalPaddingLeft();
-
-    uint16_t x = 0;
-    while ( x < lineBufferLength) {
-      camera.waitForPixelClockRisingEdge(); // YUV422 grayscale byte
-      camera.readPixelByte(lineBuffer[x]);
-      lineBuffer[x] = formatPixelByteGrayscaleFirst(lineBuffer[x]);
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 color byte. Ignore.
-      if (isSendWhileBuffering) {
-        processNextGrayscalePixelByteInBuffer();
-      }
-      x++;
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 grayscale byte
-      camera.readPixelByte(lineBuffer[x]);
-      lineBuffer[x] = formatPixelByteGrayscaleSecond(lineBuffer[x]);
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 color byte. Ignore.
-      if (isSendWhileBuffering) {
-        processNextGrayscalePixelByteInBuffer();
-      }
-      x++;
-    }
-    camera.ignoreHorizontalPaddingRight();
-
-    // Debug info to get some feedback how mutch data was processed during line read.
-    processedByteCountDuringCameraRead = lineBufferSendByte - (&lineBuffer[0]);
-
-    // Send rest of the line
-    while (lineBufferSendByte < &lineBuffer[lineLength]) {
-      processNextGrayscalePixelByteInBuffer();
-    }
-  };
-}
-
-void processNextGrayscalePixelByteInBuffer() {
-  if (isUartReady()) {
-    UDR0 = *lineBufferSendByte;
-    lineBufferSendByte++;
-  }
-}
-
-
-void processGrayscaleFrameDirect() {
-  camera.waitForVsync();
-  commandDebugPrint("Vsync");
-
-  camera.ignoreVerticalPadding();
-
-  for (uint16_t y = 0; y < lineCount; y++) {
-    camera.ignoreHorizontalPaddingLeft();
-
-    uint16_t x = 0;
-    while ( x < lineLength) {
-      camera.waitForPixelClockRisingEdge(); // YUV422 grayscale byte
-      camera.readPixelByte(lineBuffer[0]);
-      lineBuffer[0] = formatPixelByteGrayscaleFirst(lineBuffer[0]);
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 color byte. Ignore.
-      waitForPreviousUartByteToBeSent();
-      UDR0 = lineBuffer[0];
-      x++;
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 grayscale byte
-      camera.readPixelByte(lineBuffer[0]);
-      lineBuffer[0] = formatPixelByteGrayscaleSecond(lineBuffer[0]);
-
-      camera.waitForPixelClockRisingEdge(); // YUV422 color byte. Ignore.
-      waitForPreviousUartByteToBeSent();
-      UDR0 = lineBuffer[0];
-      x++;
-    }
-
-    camera.ignoreHorizontalPaddingRight();
-  }
-}
-
-uint8_t formatPixelByteGrayscaleFirst(uint8_t pixelByte) {
-  // For the First byte in the parity chek byte pair the last bit is always 0.
-  pixelByte &= 0b11111110;
-  if (pixelByte == 0) {
-    // Make pixel color always slightly above 0 since zero is a command marker.
-    pixelByte |= 0b00000010;
-  }
-  return pixelByte;
-}
-
-uint8_t formatPixelByteGrayscaleSecond(uint8_t pixelByte) {
-  // For the second byte in the parity chek byte pair the last bit is always 1.
-  return pixelByte | 0b00000001;
-}
-
-
-
 void processRgbFrameBuffered() {
   camera.waitForVsync();
-  commandDebugPrint("Vsync");
+  Serial.println(F("Vsync"));
 
   camera.ignoreVerticalPadding();
 
@@ -454,38 +373,38 @@ void processRgbFrameBuffered() {
       camera.waitForPixelClockRisingEdge();
       camera.readPixelByte(lineBuffer[x]);
       if (isSendWhileBuffering) {
-        processNextRgbPixelByteInBuffer();
+//        processNextRgbPixelByteInBuffer();
       }
     };
 
     camera.ignoreHorizontalPaddingRight();
 
     // Debug info to get some feedback how mutch data was processed during line read.
-    processedByteCountDuringCameraRead = lineBufferSendByte - (&lineBuffer[0]);
+    //processedByteCountDuringCameraRead = lineBufferSendByte - (&lineBuffer[0]);
 
+    //Serial.println(processedByteCountDuringCameraRead);
     // send rest of the line
-    while (lineBufferSendByte < &lineBuffer[lineLength * 2]) {
-      processNextRgbPixelByteInBuffer();
-    }
+//    while (lineBufferSendByte < &lineBuffer[lineLength * 2]) {
+//      processNextRgbPixelByteInBuffer();
+//    }
+    dataFile.write(lineBufferSendByte, lineBufferLength);
   }
 }
 
 void processNextRgbPixelByteInBuffer() {
   // Format pixel bytes and send out in different cycles.
   // There is not enough time to do both on faster frame rates.
-  if (isLineBufferByteFormatted) {
+//  if (isLineBufferByteFormatted) {
     tryToSendNextRgbPixelByteInBuffer();
-  } else {
-    formatNextRgbPixelByteInBuffer();
-  }
+//  } else {
+//    formatNextRgbPixelByteInBuffer();
+//  }
 }
 
 void tryToSendNextRgbPixelByteInBuffer() {
-  if (isUartReady()) {
-    UDR0 = *lineBufferSendByte;
-    lineBufferSendByte++;
-    isLineBufferByteFormatted = false;
-  }
+  dataFile.write(*lineBufferSendByte);
+  lineBufferSendByte++;
+  isLineBufferByteFormatted = false;
 }
 
 void formatNextRgbPixelByteInBuffer() {
@@ -497,38 +416,6 @@ void formatNextRgbPixelByteInBuffer() {
   isLineBufferByteFormatted = true;
   isLineBufferSendHighByte = !isLineBufferSendHighByte;
 }
-
-
-
-
-void processRgbFrameDirect() {
-  camera.waitForVsync();
-  commandDebugPrint("Vsync");
-
-  camera.ignoreVerticalPadding();
-
-  for (uint16_t y = 0; y < lineCount; y++) {
-    camera.ignoreHorizontalPaddingLeft();
-    
-    for (uint16_t x = 0; x < lineLength; x++) {
-      
-      camera.waitForPixelClockRisingEdge();
-      camera.readPixelByte(lineBuffer[0]);
-      lineBuffer[0] = formatRgbPixelByteH(lineBuffer[0]);
-      waitForPreviousUartByteToBeSent();
-      UDR0 = lineBuffer[0];
-      
-      camera.waitForPixelClockRisingEdge();
-      camera.readPixelByte(lineBuffer[0]);
-      lineBuffer[0] = formatRgbPixelByteL(lineBuffer[0]);
-      waitForPreviousUartByteToBeSent();
-      UDR0 = lineBuffer[0];
-    }
-    
-    camera.ignoreHorizontalPaddingRight();
-  };
-}
-
 
 // RRRRRGGG
 uint8_t formatRgbPixelByteH(uint8_t pixelByteH) {
@@ -556,72 +443,6 @@ uint8_t formatRgbPixelByteL(uint8_t pixelByteL) {
 }
 
 
-
-
-
-
-
-
-
-void commandStartNewFrame(uint8_t pixelFormat) {
-  waitForPreviousUartByteToBeSent();
-  UDR0 = 0x00; // New command
-
-  waitForPreviousUartByteToBeSent();
-  UDR0 = 4; // Command length
-
-  uint8_t checksum = 0;
-  checksum = sendNextCommandByte(checksum, COMMAND_NEW_FRAME);
-  checksum = sendNextCommandByte(checksum, lineLength & 0xFF); // lower 8 bits of image width
-  checksum = sendNextCommandByte(checksum, lineCount & 0xFF); // lower 8 bits of image height
-  checksum = sendNextCommandByte(checksum, 
-      ((lineLength >> 8) & 0x03) // higher 2 bits of image width
-      | ((lineCount >> 6) & 0x0C) // higher 2 bits of image height
-      | ((pixelFormat << 4) & 0xF0));
-
-  waitForPreviousUartByteToBeSent();
-  UDR0 = checksum;
-}
-
-
-void commandDebugPrint(const String debugText) {
-  if (debugText.length() > 0) {
-    
-    waitForPreviousUartByteToBeSent();
-    UDR0 = 0x00; // New commnad
-
-    waitForPreviousUartByteToBeSent();
-    UDR0 = debugText.length() + 1; // Command length. +1 for command code.
-    
-    uint8_t checksum = 0;
-    checksum = sendNextCommandByte(checksum, COMMAND_DEBUG_DATA);
-    for (uint16_t i=0; i<debugText.length(); i++) {
-      checksum = sendNextCommandByte(checksum, debugText[i]);
-    }
-
-    waitForPreviousUartByteToBeSent();
-    UDR0 = checksum;
-  }
-}
-
-
-uint8_t sendNextCommandByte(uint8_t checksum, uint8_t commandByte) {
-  waitForPreviousUartByteToBeSent();
-  UDR0 = commandByte;
-  return checksum ^ commandByte;
-}
-
-
-
-
-void waitForPreviousUartByteToBeSent() {
-  while(!isUartReady()); //wait for byte to transmit
-}
-
-
-bool isUartReady() {
-  return UCSR0A & (1<<UDRE0);
-}
 
 
 #endif
