@@ -42,6 +42,8 @@ void loop() {
   if (servoDelay == 0) { 
     myservo.write(90);
     delay(1000);
+  } else {
+    servoDelay = servoDelay - 1;
   }
   
   processFrame();
